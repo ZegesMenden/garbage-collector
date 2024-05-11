@@ -17,9 +17,6 @@ void* __heap_base;
 // pointer to the top of the heap, where the sector data will start at
 void* __heap_top;
 
-size_t __heap_used_bytes = 0;
-size_t __heap_max_size = 0;
-
 typedef union {
     uint32_t raw;
     struct {
@@ -33,12 +30,12 @@ typedef union {
     } fields;
 } __heap_sector_data_t;
 
-#define __heap_minimum_allocation_size sizeof(__heap_sector_data_t)<<2
+#define __heap_minimum_allocation_size 1
 
-#define __heap_allocation_alignment alignof(uintptr_t*)
+#define __heap_allocation_alignment alignof(max_align_t)
 
 // set to log_2 of heap allocation alignment
-#define __heap_allocation_alignment_shift 3
+#define __heap_allocation_alignment_shift 4
 
 #define __heap_maximum_allocation_size ((1<<29)-1)
 
@@ -46,7 +43,7 @@ void* __user_ptr_from_sector(__heap_sector_data_t* sector) {
     __heap_sector_data_t* sector_cur = (__heap_sector_data_t*)__heap_top;
     char* data_ptr = (char*)__heap_base;
     while ( sector != sector_cur ) {
-        data_ptr += sector_cur->fields.allocation_size;
+        data_ptr += sector_cur->fields.allocation_size * __heap_allocation_alignment;
         if ( !sector_cur->fields.next_sector_exists ) { return NULL; }
         sector_cur -= 1;
     }
@@ -58,8 +55,9 @@ __heap_sector_data_t* __heap_sector_from_user_pointer(void* usr_ptr) {
     __heap_sector_data_t* sector_cur = (__heap_sector_data_t*)__heap_top;
     size_t user_byte_idx = (char*)usr_ptr - (char*)__heap_base;
     size_t byte_idx = 0;
+    if ( byte_idx == user_byte_idx ) { return sector_cur; }
     do {
-        byte_idx += sector_cur->fields.allocation_size;
+        byte_idx += sector_cur->fields.allocation_size * __heap_allocation_alignment;
         sector_cur -= 1;
         if ( byte_idx == user_byte_idx ) { return sector_cur; }
     } while ( sector_cur->fields.next_sector_exists );
@@ -67,43 +65,12 @@ __heap_sector_data_t* __heap_sector_from_user_pointer(void* usr_ptr) {
     return NULL;
 }
 
-void __remove_empty_chunks() {
-
-    // number of sectors to move by
-    int n_sector_shift = 0;
-    __heap_sector_data_t* sector_cur;
-    __heap_sector_data_t* sector_move_start;
-
-    while (sector_cur->fields.next_sector_exists) {
-
-        // increment the shift ammount while there are empty sectors
-        if ( !sector_cur->fields.allocation_size ) {
-            n_sector_shift++;
-        }
-
-        // once we find a sector that is used, set the sector shift start to here
-        if ( n_sector_shift > 0 && sector_cur->fields.allocation_size > 0 ) {
-            sector_move_start = sector_cur;
-            while ( sector_cur->fields.next_sector_exists && sector_cur->fields.allocation_size > 0 ) {
-                sector_cur -= 1;
-            }
-            int sector_dist = sector_move_start - sector_cur;
-            for ( int i = sector_dist; i > 0; i-- ) {
-                sector_cur[i + n_sector_shift] = sector_cur[i];
-            }
-            
-        }
-
-    }
-
-}
-
 size_t heap_used_bytes() {
     __heap_sector_data_t*  sector_cur = (__heap_sector_data_t*)__heap_top;
     size_t ret = 0;
 
     while ( 1 ) {
-        ret += sector_cur->fields.allocation_size + sizeof(__heap_sector_data_t);
+        ret += (sector_cur->fields.allocation_size * __heap_allocation_alignment) + sizeof(__heap_sector_data_t);
         if ( !sector_cur->fields.next_sector_exists ) { break; }
         sector_cur -= 1;
     }
@@ -115,14 +82,13 @@ size_t heap_n_allocs() {
     size_t n_allocations = 0;
     __heap_sector_data_t* sector_cur = (__heap_sector_data_t*)__heap_top;
     
-    if ( !sector_cur->fields.next_sector_exists && sector_cur->fields.allocated ) {
-        n_allocations = 1;
-    }
+    if ( !sector_cur->fields.next_sector_exists && !sector_cur->fields.allocated ) { return 0; }
 
-    while( sector_cur->fields.next_sector_exists ) {
+    do {
         n_allocations += 1;
+        if ( !sector_cur->fields.next_sector_exists ) {break;}
         sector_cur -= 1;
-    }
+    } while(1);
 
     return n_allocations;
 }
@@ -131,39 +97,43 @@ size_t heap_size() {
     return ((char*)__heap_top) - ((char*)__heap_base);
 }
 
+void __heap_remove_unused_chunks() {
+    
+}
+
 void memalloc_init(void* heap_base, size_t heap_size) {
     
     // initialize heap variables
-    __heap_base = heap_base;
-    __heap_max_size = heap_size;
-    __heap_top = (void*)((char*)__heap_base + __heap_max_size - sizeof(__heap_sector_data_t));
+    __heap_base = heap_base;\
+    __heap_top = (void*)((char*)__heap_base + heap_size - sizeof(__heap_sector_data_t));
     
     // initialize top pointer
     __heap_sector_data_t* heap_top_ptr = (__heap_sector_data_t*)__heap_top;
     heap_top_ptr->fields.allocated = 0;
     heap_top_ptr->fields.allocation_size = 0;
+    heap_top_ptr->fields.sector_is_reachable = 0;
     heap_top_ptr->fields.next_sector_exists = 0;
 
 }
 
-void* memalloc(size_t size) {
+void* memalloc(size_t _size) {
 
     __allocdebugprintf("memalloc init:\n");
 
-    size_t size_alloc = size;
+    size_t size_alloc = _size;
 
     // align the allocation
     size_alloc += (__heap_allocation_alignment - 1);
     size_alloc >>= __heap_allocation_alignment_shift;
+
+    __allocdebugprintf("\tbytes used for allocation: %llu\n", size_alloc * __heap_allocation_alignment);
 
     if ( size_alloc > __heap_maximum_allocation_size ) {
         __allocdebugprintf("\tallocation size is greater than the maximum, exiting\n");
         return NULL;
     }
 
-    
-
-    size_alloc = size > __heap_minimum_allocation_size ? size : __heap_minimum_allocation_size;
+    size_alloc = size_alloc > __heap_minimum_allocation_size ? size_alloc : __heap_minimum_allocation_size;
 
     // search for existing sector that could work
     __heap_sector_data_t* sector_cur = (__heap_sector_data_t*)__heap_top;
@@ -191,10 +161,10 @@ void* memalloc(size_t size) {
 
     __allocdebugprintf("\tfinding the top of the heap\n");
 
-    // find the end of the data segment of the heap
-    void* heap_data_end = (void*)((char*)__heap_base + __heap_used_bytes + size);
-    if ( heap_data_end > (void*)((char*)sector_cur-sizeof(__heap_sector_data_t)) ) {     
+    // check that there is free space in the heap for this allocation
+    if ( heap_size() - heap_used_bytes() < size_alloc*__heap_allocation_alignment ) {     
         __allocdebugprintf("\tERROR: not enough space in the heap!\n");
+        __allocdebugprintf("\t%llu bytes free, %llu bytes needed\n", heap_size() - heap_used_bytes(), size_alloc*__heap_allocation_alignment);
         return NULL; 
     }
 
@@ -214,7 +184,7 @@ void* memalloc(size_t size) {
     // iterate to the next sector
     sector_cur -= 1;
 
-    sector_cur->fields.allocation_size = size;
+    sector_cur->fields.allocation_size = size_alloc;
     sector_cur->fields.allocated = 1;
     sector_cur->fields.next_sector_exists = 0;
 
@@ -242,7 +212,8 @@ void* memrealloc(void* ptr, size_t size_realloc) {
 
     __allocdebugprintf("\tfreeing old memory\t");
 
-    // memfree(ptr);
+    // mark the current sector as freed
+    // but dont actually remove it from the heap so that we can keep the data if a new allocation fails
 
     sector_realloc->fields.allocated = 0;
     
@@ -321,7 +292,7 @@ void memfree(void* user_ptr) {
         uint32_t total_free_bytes = dealloc_sector->fields.allocation_size + \
                                     sector_prev->fields.allocation_size + \
                                     sector_next->fields.allocation_size;
-        
+
         if ( total_free_bytes > __heap_maximum_allocation_size ) {
             uint32_t split_bytes = total_free_bytes - __heap_maximum_allocation_size;
 
@@ -334,8 +305,8 @@ void memfree(void* user_ptr) {
         }
 
         sector_next->fields.allocation_size = 0;
-        sector_prev->fields.allocation_size = total_free_bytes;
         dealloc_sector->fields.allocation_size = 0;
+        sector_prev->fields.allocation_size = total_free_bytes;
 
         __allocdebugprintf("\tdone\n");
         
@@ -396,7 +367,7 @@ void memprint() {
     do {
         next_sector_exists = sector_cur->fields.next_sector_exists;
         __allocdebugprintf("sector %i:\n", sector_idx);
-        __allocdebugprintf("\tsize: %i\n", sector_cur->fields.allocation_size);
+        __allocdebugprintf("\tsize: %i\n", sector_cur->fields.allocation_size * __heap_allocation_alignment);
         __allocdebugprintf("\tallocated: %i\n", sector_cur->fields.allocated);
         sector_cur -= 1;
         sector_idx++;
